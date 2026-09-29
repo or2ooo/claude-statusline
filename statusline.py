@@ -29,10 +29,17 @@ CTX_YELLOW_AT = 60
 CTX_RED_AT = 85
 LIMIT_YELLOW_AT = 60
 LIMIT_RED_AT = 85
+COST_YELLOW_AT = 5.0    # session USD (list-price estimate from Claude Code)
+COST_RED_AT = 20.0
+CACHE_YELLOW_BELOW_PCT = 70  # prompt-cache hit ratio, main conversation only
+CACHE_RED_BELOW_PCT = 40
+# Bedrock regional CRIS profiles bill +10% over list; flag their estimate with ≈
+REGIONAL_MODEL_PREFIXES = ("eu.", "us.", "apac.", "us-gov.")
 
 # Hide-when-quiet thresholds
 DURATION_HIDE_BELOW_MS = 60_000  # hide ⏱ under 1 minute
 SEVEN_DAY_HIDE_BELOW_PCT = 50    # hide 7d unless it's getting close
+COST_HIDE_BELOW_USD = 0.01       # hide $ until the first cent
 # ---------------------------------------------------------------------
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
@@ -90,6 +97,14 @@ def fmt_duration_ms(ms) -> str:
         return f"{mins}m"
     hours = mins // 60
     return f"{hours}h{mins % 60:02d}m"
+
+
+def fmt_cost(usd: float) -> str:
+    if usd < 10:
+        return f"${usd:.2f}"
+    if usd < 1000:
+        return f"${usd:.1f}"
+    return f"${usd / 1000:.1f}k"
 
 
 def fmt_remaining(resets_at) -> str | None:
@@ -274,6 +289,22 @@ def build_segments(data: dict):
         text = f"⏱ {fmt_duration_ms(dur_ms)}"
         line1.append((70, text, f"{C.GRAY}{text}{C.RESET}"))
 
+    # Session cost — Claude Code's list-price estimate; one ledger per session,
+    # so it includes subagents, workflow agents and background helpers.
+    # Bedrock regional profiles (eu./us./apac.) bill +10% over list → ≈ marker.
+    usd = cost.get("total_cost_usd")
+    if isinstance(usd, (int, float)) and not isinstance(usd, bool) and usd >= COST_HIDE_BELOW_USD:
+        model_id = (data.get("model") or {}).get("id") or ""
+        approx = "≈" if model_id.startswith(REGIONAL_MODEL_PREFIXES) else ""
+        text = f"{approx}{fmt_cost(usd)}"
+        if usd >= COST_RED_AT:
+            col = C.RED
+        elif usd >= COST_YELLOW_AT:
+            col = C.YELLOW
+        else:
+            col = C.GRAY
+        line1.append((75, text, f"{col}{text}{C.RESET}"))
+
     # Lines added / removed — hidden when both zero, plain gray otherwise
     added = cost.get("total_lines_added") or 0
     removed = cost.get("total_lines_removed") or 0
@@ -298,6 +329,37 @@ def build_segments(data: dict):
         f"{C.DIM}· {tok_text}{C.RESET}"
     )
     line2.append((100, plain, colored))
+
+    # Prompt cache — main conversation only (subagents aren't counted). Hit
+    # ratio plus warm/cold state to judge the 5m vs 1h TTL trade-off.
+    pc = data.get("prompt_cache") or {}
+    ratio = pc.get("hit_ratio")
+    if pc.get("requests") and ratio is not None:
+        try:
+            hit = float(ratio)
+        except (TypeError, ValueError):
+            hit = None
+        if hit is not None:
+            hit_pct = int(round(hit * 100 if hit <= 1 else hit))
+            if hit_pct < CACHE_RED_BELOW_PCT:
+                col = C.RED
+            elif hit_pct < CACHE_YELLOW_BELOW_PCT:
+                col = C.YELLOW
+            else:
+                col = C.GRAY
+            if pc.get("warm"):
+                left = fmt_remaining(pc.get("expires_at"))
+                state = f"warm {left[:-5]}" if left and left.endswith(" left") else "warm"
+            else:
+                state = "cold"
+            ttl = pc.get("ttl")
+            ttl_part = f"{ttl} · " if ttl in ("5m", "1h") else ""
+            plain = f"cache {hit_pct}% · {ttl_part}{state}"
+            colored = (
+                f"{C.GRAY}cache{C.RESET} {col}{hit_pct}%{C.RESET} "
+                f"{C.DIM}· {ttl_part}{state}{C.RESET}"
+            )
+            line2.append((45, plain, colored))
 
     rl = data.get("rate_limits") or {}
     five = rl.get("five_hour") or {}

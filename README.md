@@ -1,10 +1,10 @@
 # claude-statusline
 
-Cross-platform two-line color status line for [Claude Code](https://claude.ai/code). Renders model, project dir, git branch (with dirty / ahead / behind markers), context-window usage, 5-hour and 7-day rate limits, and a clock — refreshed every 30 seconds.
+Cross-platform two-line color status line for [Claude Code](https://claude.ai/code). Renders model, project dir, git branch (with dirty / ahead / behind markers), session cost, context-window usage, prompt-cache hit ratio, 5-hour and 7-day rate limits, and a clock — refreshed every 30 seconds.
 
 ```
- Sonnet 4.6  │  my-project │  main ✱2 ↑1 │ ⚡ high │ ⏱ 4m
-Ctx 38% · 76k/200k │ ⏰ 5h 22% · 3h 12m left │ 🕒 14:23
+ Sonnet 4.6  │  my-project │  main ✱2 ↑1 │ ⚡ high │ ⏱ 4m │ $1.37
+Ctx 38% · 76k/200k │ cache 91% · 1h · warm 52m │ ⏰ 5h 22% · 3h 12m left │ 🕒 14:23
 ```
 
 Designed to stay quiet (gray) when things are calm, and color (yellow / red) only when state crosses a threshold worth attention.
@@ -51,15 +51,17 @@ iwr https://raw.githubusercontent.com/or2ooo/claude-statusline/main/statusline.c
 - output style (when not `default`) — gray
 - effort level — gray (low/medium), yellow (high), red (xhigh/max)
 - duration (only when ≥ 1 minute) — gray
+- session cost `$<usd>` (hidden under $0.01) — Claude Code's list-price estimate for the whole session, subagents included; gray, yellow ≥ $5, red ≥ $20. Prefixed with `≈` on Bedrock regional profiles (`eu.` / `us.` / `apac.` / `us-gov.`), which bill +10% over list
 - lines added/removed (when nonzero) — gray
 
 **Line 2**
 - context window: `Ctx <pct>% · <used>/<total>`
+- prompt cache: `cache <hit>% · <ttl> · warm <countdown>` or `… · cold` (main conversation only; hidden until the first request) — gray ≥ 70%, yellow < 70%, red < 40%
 - 5-hour rate limit: `⏰ 5h <pct>% · <countdown>`
 - 7-day rate limit: `7d <pct>%` (hidden under 50% to reduce noise)
 - clock: `🕒 HH:MM`
 
-Color thresholds are gray < 60% < yellow < 85% < red.
+Color thresholds for context and rate limits are gray < 60% < yellow < 85% < red.
 
 ## Cross-platform notes
 
