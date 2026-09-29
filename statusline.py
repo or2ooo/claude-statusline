@@ -20,8 +20,10 @@ import time
 from pathlib import Path
 
 # ---------- Tunables -------------------------------------------------
-GIT_CACHE_TTL_SECONDS = 2
+GIT_CACHE_TTL_SECONDS = 10   # dirty / ahead / behind only; branch is never cached
 GIT_CACHE_DIR = Path(tempfile.gettempdir())
+GIT_BRANCH_TIMEOUT_S = 1      # symbolic-ref / rev-parse: ~20 ms even in huge repos
+GIT_STATUS_TIMEOUT_S = 3      # status scans untracked files; can take seconds
 NARROW_COLUMNS = 80
 WIDE_FALLBACK_COLUMNS = 120
 
@@ -131,56 +133,62 @@ def fmt_remaining(resets_at) -> str | None:
     return f"{days}d left" if rem_h == 0 else f"{days}d {rem_h}h left"
 
 
-def get_git_info(cwd: str):
-    """Return dict with branch/dirty/ahead/behind, or None if not a git repo."""
-    if not cwd:
-        return None
-    cwd_path = Path(cwd)
-    if not cwd_path.exists():
-        return None
-
-    cache_key = hashlib.sha256(cwd.encode()).hexdigest()[:16]
-    cache_file = GIT_CACHE_DIR / f"cc-statusline-git-{cache_key}"
-
-    try:
-        if cache_file.exists():
-            age = time.time() - cache_file.stat().st_mtime
-            if age < GIT_CACHE_TTL_SECONDS:
-                return json.loads(cache_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        pass
-
+def _git(args, cwd: str, timeout: float):
+    """Run a read-only git command; return stripped stdout, or None on any failure."""
     try:
         result = subprocess.run(
-            ["git", "--no-optional-locks", "status", "--porcelain=v2", "--branch"],
+            ["git", "--no-optional-locks", *args],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             cwd=cwd,
-            timeout=2,
+            timeout=timeout,
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+    except (subprocess.TimeoutExpired, OSError):
         return None
-
     if result.returncode != 0:
         return None
+    return result.stdout.strip()
 
-    branch = None
-    sha = None
+
+def _git_head(cwd: str):
+    """Return (branch_or_short_sha, detached), or None if not a git repo.
+
+    Fast (~20 ms) regardless of repo size, so it runs fresh every time.
+    """
+    branch = _git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, GIT_BRANCH_TIMEOUT_S)
+    if branch:
+        return branch, False
+    # Detached HEAD or mid-rebase
+    sha = _git(["rev-parse", "--short", "HEAD"], cwd, GIT_BRANCH_TIMEOUT_S)
+    if sha:
+        return sha, True
+    return None
+
+
+def _git_status_counts(cwd: str):
+    """Return (head, detached, dirty, ahead, behind) from `git status`, or None.
+
+    `head` is the branch name, or the full commit ID when detached.
+    """
+    out = _git(["status", "--porcelain=v2", "--branch"], cwd, GIT_STATUS_TIMEOUT_S)
+    if out is None:
+        return None
+
+    head = None
+    oid = ""
     ahead = 0
     behind = 0
     dirty = 0
-
-    for line in result.stdout.splitlines():
+    for line in out.splitlines():
         if line.startswith("# branch.head"):
             parts = line.split(" ", 2)
-            if len(parts) >= 3:
-                branch = parts[2]
-                if branch == "(detached)":
-                    branch = None
+            if len(parts) >= 3 and parts[2] != "(detached)":
+                head = parts[2]
         elif line.startswith("# branch.oid"):
             parts = line.split(" ", 2)
             if len(parts) >= 3:
-                sha = parts[2]
+                oid = parts[2]
         elif line.startswith("# branch.ab"):
             parts = line.split()
             if len(parts) >= 4:
@@ -192,20 +200,94 @@ def get_git_info(cwd: str):
         elif line and not line.startswith("#"):
             dirty += 1
 
-    info = {
-        "branch": branch or (sha[:7] if sha else None),
-        "detached": branch is None,
-        "ahead": ahead,
-        "behind": behind,
-        "dirty": dirty,
-    }
+    if head is not None:
+        return head, False, dirty, ahead, behind
+    return oid, True, dirty, ahead, behind
 
+
+def _counts_match(cached, branch: str, detached: bool) -> bool:
+    """True if cached counts were computed on the HEAD we're showing now."""
+    if not isinstance(cached, dict) or cached.get("detached") != detached:
+        return False
+    head = cached.get("head")
+    if not isinstance(head, str) or not head:
+        return False
+    # Detached: cache holds the full commit ID; `branch` is its short form.
+    return head.startswith(branch) if detached else head == branch
+
+
+def get_git_info(cwd: str):
+    """Return dict with branch/dirty/ahead/behind, or None if not a git repo.
+
+    The branch is read fresh every run (fast). Only the slow `git status`
+    extras are cached, tagged with the HEAD they belong to, and reused only
+    while that HEAD is still current. If `git status` fails or times out, the
+    branch still shows — with the last counts for that HEAD, or none.
+    """
+    if not cwd:
+        return None
+    if not Path(cwd).is_dir():
+        return None
+
+    head = _git_head(cwd)
+    if head is None:
+        return None
+    branch, detached = head
+    info = {"branch": branch, "detached": detached, "ahead": 0, "behind": 0, "dirty": 0}
+
+    cache_key = hashlib.sha256(cwd.encode()).hexdigest()[:16]
+    cache_file = GIT_CACHE_DIR / f"cc-statusline-gitcounts-{cache_key}"
+
+    cached = None
+    age = None
     try:
-        cache_file.write_text(json.dumps(info))
-    except OSError:
-        pass
+        age = time.time() - cache_file.stat().st_mtime
+        cached = json.loads(cache_file.read_text())
+    except (OSError, ValueError):
+        cached = None
 
+    matches = _counts_match(cached, branch, detached)
+
+    def apply(entry):
+        for k in ("dirty", "ahead", "behind"):
+            v = entry.get(k)
+            if isinstance(v, int):
+                info[k] = v
+
+    if matches and age is not None and age < GIT_CACHE_TTL_SECONDS:
+        # Fresh counts, or a recent failure we shouldn't retry yet.
+        apply(cached)
+        return info
+
+    status = _git_status_counts(cwd)
+    if status is not None and _counts_match(
+        {"head": status[0], "detached": status[1]}, branch, detached
+    ):
+        s_head, s_detached, dirty, ahead, behind = status
+        entry = {"head": s_head, "detached": s_detached,
+                 "dirty": dirty, "ahead": ahead, "behind": behind}
+    else:
+        # Timed out, failed, or HEAD moved mid-scan: keep the last counts for
+        # this HEAD if we have them, else show none. Rewriting the entry
+        # refreshes its mtime so a stuck `git status` isn't retried every run.
+        entry = dict(cached) if matches else {"head": branch, "detached": detached}
+
+    apply(entry)
+    _write_cache(cache_file, entry)
     return info
+
+
+def _write_cache(path: Path, entry: dict) -> None:
+    """Atomic write, so concurrent sessions never read a half-written file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(entry))
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 def build_segments(data: dict):

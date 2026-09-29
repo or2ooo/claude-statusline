@@ -16,8 +16,9 @@ These caused real bugs during the initial Mac→Windows port. Don't undo them.
 - **`statusline.cmd` invokes `python -X utf8 …`**. Without `-X utf8`, Python on Hebrew/Arabic-locale Windows defaults to cp1255/cp1256 and crashes when printing the Unicode separators (`│`, `⏰`, `✱`). UTF-8 mode forces stdout to UTF-8 regardless of system codepage.
 - **`statusline.cmd` calls `python`**, not `python3`. Windows ships `python` from the Microsoft Store / installer; `python3` is a Unix convention.
 - **`.gitattributes` is load-bearing.** `*.sh` and `*.py` must be `eol=lf` (CRLF in a shebang line breaks `/usr/bin/env`). `*.cmd` must be `eol=crlf`. Don't delete this file.
-- **`git status --no-optional-locks`** in `get_git_info`. Without this flag, the 30-second status refresh would create `.git/index.lock` and conflict with foreground commits/rebases.
-- **`subprocess.run(..., timeout=2)`** for the git call. A stuck git process must not freeze the status line.
+- **Every git call goes through `_git()`, which adds `--no-optional-locks`.** Without it, the 30-second status refresh would create `.git/index.lock` and conflict with foreground commits/rebases. Git commands must stay read-only.
+- **Every git call has a timeout** (`GIT_BRANCH_TIMEOUT_S` ≈ 1s, `GIT_STATUS_TIMEOUT_S` ≈ 3s). A stuck git process must not freeze the status line.
+- **The branch is never cached.** It's read fresh each run with `symbolic-ref` (fallback `rev-parse --short HEAD` for detached/mid-rebase), which is ~20 ms even in huge repos. Only the slow `git status` extras (dirty, ahead/behind) are cached, tagged with the HEAD they were computed on, and reused only on that same HEAD. A failed or timed-out `git status` must never hide the branch — it just drops or reuses the counts. (Caching the whole segment made the branch flicker away in big repos where `git status` takes ~2s.)
 
 ## Don't break the install model
 
